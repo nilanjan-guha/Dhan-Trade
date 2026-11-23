@@ -1,18 +1,34 @@
 """
-Live Market Data Engine for Dhan Trading Terminal
-Fetches actual real-time NSE indices and live option chain prices with automatic trade lifecycle management:
-- Live Index Spot & Percent Change
-- Live Option Chain Quotes (PE/CE LTP, Volume, OI)
-- Automatic Trade State Machine:
-    * WAITING_FOR_TRIGGER: Price hasn't entered the buy Order Block
-    * ACTIVE_IN_TRADE: Price reached Order Block, tracking live P&L
-    * TARGET_HIT (TP): Target reached, trade removed and archived, radar scans for fresh setup
-    * STOPLOSS_HIT (SL): Stoploss reached, trade terminated, radar scans for fresh setup
+Live Market Data Engine & Trade Position Tracker for Dhan Trading Terminal
+Tracks actual real-time NSE indices and live option chain prices with persistent trade position tracking:
+- Locks onto entry premium when trade is taken or active
+- Continuously monitors Live LTP vs SL and Target (TP)
+- Displays Live P&L, % Gain, and Trailing Buffer
+- Only terminates/removes trade when Target (TP) or Strict SL is actually breached
 """
 
 import json
+import os
 import urllib.request
-from typing import Dict, Any, Optional
+from typing import Dict, Any
+
+TRADE_STATE_FILE = os.path.join(os.path.dirname(__file__), "active_positions.json")
+
+def load_active_positions() -> Dict[str, Any]:
+    if os.path.exists(TRADE_STATE_FILE):
+        try:
+            with open(TRADE_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_active_positions(data: Dict[str, Any]):
+    try:
+        with open(TRADE_STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 def fetch_live_nse_indices() -> Dict[str, Any]:
     """Fetches real-time spot prices from official NSE API."""
@@ -22,8 +38,8 @@ def fetch_live_nse_indices() -> Dict[str, Any]:
         "Accept": "application/json"
     }
     result = {
-        "NIFTY": {"spot": 25632.55, "change": -168.05, "pChange": -0.65},
-        "BANKNIFTY": {"spot": 63400.65, "change": -1234.55, "pChange": -1.91},
+        "NIFTY": {"spot": 25617.85, "change": -182.75, "pChange": -0.71},
+        "BANKNIFTY": {"spot": 63410.30, "change": -1224.90, "pChange": -1.90},
         "VIX": {"spot": 18.27, "change": 0.95, "pChange": 5.47},
         "SENSEX": {"spot": 83520.47, "change": -399.24, "pChange": -0.48}
     }
@@ -36,15 +52,15 @@ def fetch_live_nse_indices() -> Dict[str, Any]:
                     idx_name = item.get("index")
                     if idx_name == "NIFTY 50":
                         result["NIFTY"] = {
-                            "spot": float(item.get("last", 25632.55)),
-                            "change": float(item.get("variation", -168.05)),
-                            "pChange": float(item.get("percentChange", -0.65))
+                            "spot": float(item.get("last", 25617.85)),
+                            "change": float(item.get("variation", -182.75)),
+                            "pChange": float(item.get("percentChange", -0.71))
                         }
                     elif idx_name == "NIFTY BANK":
                         result["BANKNIFTY"] = {
-                            "spot": float(item.get("last", 63400.65)),
-                            "change": float(item.get("variation", -1234.55)),
-                            "pChange": float(item.get("percentChange", -1.91))
+                            "spot": float(item.get("last", 63410.30)),
+                            "change": float(item.get("variation", -1224.90)),
+                            "pChange": float(item.get("percentChange", -1.90))
                         }
                     elif idx_name == "INDIA VIX":
                         result["VIX"] = {
@@ -60,7 +76,6 @@ def fetch_live_nse_indices() -> Dict[str, Any]:
 def fetch_live_option_chain(symbol: str) -> Dict[float, Dict[str, Any]]:
     """
     Fetches actual real-time option chain strikes, LTP, Volume, and OI for Bank Nifty or Nifty.
-    Returns: { strike: {"PE": {...}, "CE": {...}} }
     """
     slug = "nifty-bank" if symbol == "BANKNIFTY" else "nifty"
     url = f"https://groww.in/v1/api/option_chain_service/v1/option_chain/{slug}?exchange=NSE"
@@ -93,48 +108,72 @@ def fetch_live_option_chain(symbol: str) -> Dict[float, Dict[str, Any]]:
     return quotes
 
 
-def evaluate_trade_status(ltp: float, entry_ob: float, max_chase: float, sl: float, tgt: float) -> Dict[str, Any]:
+def track_and_evaluate_trade(symbol: str, strike_str: str, current_ltp: float, entry_price: float, sl: float, tgt: float) -> Dict[str, Any]:
     """
-    Evaluates lifecycle of an options buy setup:
-    - If LTP >= tgt: Target Hit (Trade is completed/closed, search for fresh setup)
-    - If LTP <= sl: Stop Loss Hit (Trade invalidated/closed, search for fresh setup)
-    - If LTP > max_chase: Runaway (Do not chase, wait for pullback)
-    - If entry_ob <= LTP <= max_chase: Active Entry Zone
-    - If LTP < entry_ob and LTP > sl: Awaiting Pullback to Order Block
+    Tracks an active option position with live LTP until it explicitly hits Target (TP) or Stop Loss (SL).
     """
-    if ltp >= tgt:
+    positions = load_active_positions()
+    pos = positions.get(symbol)
+    
+    # If no position saved yet, initialize it
+    if not pos:
+        pos = {
+            "symbol": symbol,
+            "strike": strike_str,
+            "entry_price": entry_price,
+            "current_ltp": current_ltp,
+            "sl": sl,
+            "tgt": tgt,
+            "status": "RUNNING",
+            "pnl_pts": round(current_ltp - entry_price, 2),
+            "pnl_pct": round(((current_ltp - entry_price) / entry_price) * 100, 2)
+        }
+        positions[symbol] = pos
+        save_active_positions(positions)
+    else:
+        # Update running values
+        pos["current_ltp"] = current_ltp
+        pos["pnl_pts"] = round(current_ltp - pos["entry_price"], 2)
+        pos["pnl_pct"] = round(((current_ltp - pos["entry_price"]) / pos["entry_price"]) * 100, 2)
+    
+    # Check if Target Hit
+    if current_ltp >= pos["tgt"]:
+        pos["status"] = "TARGET_HIT"
+        positions[symbol] = pos
+        save_active_positions(positions)
         return {
             "state": "TARGET_HIT",
-            "badge": "🎯 TARGET HIT (+PROFIT LOCKED)",
+            "badge": "🎯 TARGET HIT (+PROFIT BOOKED)",
             "color": "#10b981",
             "is_active": False,
-            "can_enter": False,
-            "status_text": f"Target of ₹{tgt:.2f} reached! Trade exited and archived. Radar scanning for new setup..."
+            "pos": pos,
+            "status_text": f"Target of ₹{pos['tgt']:.2f} REACHED! Profit: +₹{pos['pnl_pts']:.2f} ({pos['pnl_pct']:+.1f}%). Trade exited. Searching for next setup..."
         }
-    elif ltp <= sl:
+    
+    # Check if Stop Loss Hit
+    elif current_ltp <= pos["sl"]:
+        pos["status"] = "STOPLOSS_HIT"
+        positions[symbol] = pos
+        save_active_positions(positions)
         return {
             "state": "STOPLOSS_HIT",
-            "badge": "🛑 STOP LOSS HIT (RISK PROTECTED)",
+            "badge": "🛑 STOP LOSS HIT (PROTECTED)",
             "color": "#ef4444",
             "is_active": False,
-            "can_enter": False,
-            "status_text": f"Stop loss of ₹{sl:.2f} hit. Trade terminated. Radar scanning for new setup..."
+            "pos": pos,
+            "status_text": f"Stop loss of ₹{pos['sl']:.2f} HIT. Loss: ₹{pos['pnl_pts']:.2f} ({pos['pnl_pct']:+.1f}%). Trade exited. Searching for next setup..."
         }
-    elif ltp > max_chase:
-        return {
-            "state": "OVER_CHASE",
-            "badge": "⚠️ ANTI-CHASE TRIGGERED",
-            "color": "#f59e0b",
-            "is_active": False,
-            "can_enter": False,
-            "status_text": f"Price ₹{ltp:.2f} crossed max buy cap ₹{max_chase:.2f}. DO NOT CHASE. Wait for pullback."
-        }
+    
+    # Otherwise trade remains ACTIVE and is actively tracked with live LTP
     else:
+        pos["status"] = "RUNNING"
+        positions[symbol] = pos
+        save_active_positions(positions)
         return {
-            "state": "READY_TO_BUY",
-            "badge": "🔥 READY FOR FRESH BUY ENTRY",
-            "color": "#38bdf8",
+            "state": "RUNNING",
+            "badge": f"🔥 POSITION ACTIVE | LIVE LTP ₹{current_ltp:.2f}",
+            "color": "#10b981" if pos["pnl_pts"] >= 0 else "#f43f5e",
             "is_active": True,
-            "can_enter": True,
-            "status_text": f"LTP ₹{ltp:.2f} is inside optimal Institutional Order Block zone [₹{entry_ob:.2f} - ₹{max_chase:.2f}]."
+            "pos": pos,
+            "status_text": f"Tracking live premium: Entry: ₹{pos['entry_price']:.2f} | Current LTP: ₹{current_ltp:.2f} | P&L: {pos['pnl_pts']:+.2f} pts ({pos['pnl_pct']:+.1f}%) | SL: ₹{pos['sl']:.2f} | Target: ₹{pos['tgt']:.2f}"
         }

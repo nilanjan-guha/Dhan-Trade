@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import time
 import plotly.graph_objects as go
-from live_data_feed import fetch_live_nse_indices, fetch_live_option_chain, evaluate_trade_status
+from live_data_feed import fetch_live_nse_indices, fetch_live_option_chain, track_and_evaluate_trade, load_active_positions, save_active_positions
 
 st.set_page_config(
     page_title="Apex Institutional Terminal | Real-Time Live Orderflow",
@@ -95,11 +95,6 @@ st.markdown("""
         animation: putGlow 2s infinite alternate;
     }
 
-    .banner-call {
-        background: linear-gradient(135deg, rgba(16, 185, 129, 0.22) 0%, rgba(15, 23, 42, 0.95) 100%);
-        border: 2px solid #10b981;
-    }
-
     .banner-completed {
         background: linear-gradient(135deg, rgba(56, 189, 248, 0.2) 0%, rgba(15, 23, 42, 0.95) 100%);
         border: 2px solid #38bdf8;
@@ -160,15 +155,15 @@ oc_nifty = fetch_live_option_chain("NIFTY")
 
 # BANK NIFTY LIVE OPTION PRICING
 bn_pe_quote = oc_bn.get(float(bn_atm), {}).get("PE", {})
-bn_live_ltp = bn_pe_quote.get("ltp") if bn_pe_quote.get("ltp", 0) > 0 else 373.70
-bn_live_vol = bn_pe_quote.get("volume", 8970810)
-bn_live_oi = bn_pe_quote.get("oi", 15937)
+bn_live_ltp = bn_pe_quote.get("ltp") if bn_pe_quote.get("ltp", 0) > 0 else 327.20
+bn_live_vol = bn_pe_quote.get("volume", 9413340)
+bn_live_oi = bn_pe_quote.get("oi", 16966)
 
-# Safe Dynamic OB, SL, Target calibrated to Bank Nifty ATM premium
-bn_ob = round(bn_live_ltp * 0.97, 1)      # Order Block: 3% pullback entry
-bn_max_chase = round(bn_live_ltp * 1.04, 1) # Anti-chase limit (+4%)
-bn_sl = round(bn_live_ltp * 0.85, 1)      # Strict 15% risk stoploss
-bn_tgt = round(bn_live_ltp * 1.30, 1)     # 30% reward target (1:2 RR)
+# Saved active trade or fresh parameters
+bn_entry_def = 317.40
+bn_sl_def = 278.10
+bn_tgt_def = 425.40
+bn_chase_def = 340.30
 
 # NIFTY LIVE OPTION PRICING
 nifty_pe_quote = oc_nifty.get(float(nifty_atm), {}).get("PE", {})
@@ -176,37 +171,36 @@ nifty_live_ltp = nifty_pe_quote.get("ltp") if nifty_pe_quote.get("ltp", 0) > 0 e
 nifty_live_vol = nifty_pe_quote.get("volume", 259307425)
 nifty_live_oi = nifty_pe_quote.get("oi", 213466)
 
-nifty_ob = round(nifty_live_ltp * 0.96, 1)
-nifty_max_chase = round(nifty_live_ltp * 1.05, 1)
-nifty_sl = round(nifty_live_ltp * 0.82, 1)
-nifty_tgt = round(nifty_live_ltp * 1.35, 1)
+nifty_entry_def = round(nifty_live_ltp * 0.96, 1)
+nifty_sl_def = round(nifty_live_ltp * 0.82, 1)
+nifty_tgt_def = round(nifty_live_ltp * 1.35, 1)
+nifty_chase_def = round(nifty_live_ltp * 1.05, 1)
 
-# Evaluate Trade Lifecycle (Checks if Target or SL was hit and resets/removes)
-bn_status = evaluate_trade_status(bn_live_ltp, bn_ob, bn_max_chase, bn_sl, bn_tgt)
-nifty_status = evaluate_trade_status(nifty_live_ltp, nifty_ob, nifty_max_chase, nifty_sl, nifty_tgt)
+# Persistent Trade Tracker: Monitors LTP until SL or Target is explicitly hit
+bn_tracker = track_and_evaluate_trade("BANKNIFTY", f"{bn_atm} PE", bn_live_ltp, bn_entry_def, bn_sl_def, bn_tgt_def)
+nifty_tracker = track_and_evaluate_trade("NIFTY", f"{nifty_atm} PE", nifty_live_ltp, nifty_entry_def, nifty_sl_def, nifty_tgt_def)
 
 # 2. MARKET RADAR DATA STRUCTURE
 market_radar = {
     "BANKNIFTY": {
         "trend": f"SEVERE CRACKDOWN ({bn_chg:+.2f} PTS)",
         "trend_color": "#ef4444",
-        "trend_summary": f"BankNifty cracked down to {bn_spot:,.2f} ({bn_pchg:+.2f}%). Heavy call dump, institutions loading PE.",
+        "trend_summary": f"BankNifty cracked down to {bn_spot:,.2f} ({bn_pchg:+.2f}%). Heavy institutional Put accumulation.",
         "pcr": 0.52,
         "pcr_desc": "Heavy Call Resistance (Bearish Orderflow)",
         "direction": "PUT",
-        "has_trade": bn_status["is_active"],
-        "lifecycle": bn_status,
+        "has_trade": bn_tracker["is_active"],
+        "tracker": bn_tracker,
         "selected_strike": f"{bn_atm} PUT (PE)",
         "strike_reason": f"Strike {bn_atm} PE selected: Highest Traded Volume ({bn_live_vol:,.0f} contracts) | Delta: -0.51",
         "volume_contracts": f"{bn_live_vol:,.0f} Contracts",
         "open_interest": f"{bn_live_oi:,.0f} OI",
         
         "current_ltp": bn_live_ltp,
-        "ideal_ob": bn_ob,
-        "max_chase": bn_max_chase,
-        "sl": bn_sl,
-        "tgt": bn_tgt,
-        "vwap": round(bn_live_ltp * 0.98, 1),
+        "ideal_ob": bn_entry_def,
+        "max_chase": bn_chase_def,
+        "sl": bn_sl_def,
+        "tgt": bn_tgt_def,
         
         "spot": bn_spot,
         "spot_txt": f"{bn_spot:,.2f}",
@@ -217,38 +211,37 @@ market_radar = {
         "gamma": 0.0011,
         "vega": 28.5,
         "ranked_strikes": [
-            {"Rank": "⭐ #1 (SELECTED)", "Strike": f"{bn_atm} PE", "Type": "ATM", "LTP": f"₹{bn_live_ltp:.2f}", "Volume": f"{bn_live_vol:,.0f}", "OI": f"{bn_live_oi:,.0f}", "Liquidity Score": "99/100 🔥", "Verdict": bn_status["badge"]},
-            {"Rank": "#2", "Strike": f"{bn_atm+100} PE", "Type": "ITM", "LTP": f"₹{oc_bn.get(float(bn_atm+100), {}).get('PE', {}).get('ltp', round(bn_live_ltp+60, 2)):.2f}", "Volume": "7,461,600", "OI": "12,400", "Liquidity Score": "92/100", "Verdict": "ITM (Higher Premium)"},
-            {"Rank": "#3", "Strike": f"{bn_atm-100} PE", "Type": "OTM", "LTP": f"₹{oc_bn.get(float(bn_atm-100), {}).get('PE', {}).get('ltp', round(bn_live_ltp-55, 2)):.2f}", "Volume": "8,324,640", "OI": "14,800", "Liquidity Score": "86/100", "Verdict": "OTM"}
+            {"Rank": "⭐ #1 (SELECTED)", "Strike": f"{bn_atm} PE", "Type": "ATM", "LTP": f"₹{bn_live_ltp:.2f}", "Volume": f"{bn_live_vol:,.0f}", "OI": f"{bn_live_oi:,.0f}", "Liquidity Score": "99/100 🔥", "Verdict": bn_tracker["badge"]},
+            {"Rank": "#2", "Strike": f"{bn_atm+100} PE", "Type": "ITM", "LTP": f"₹{oc_bn.get(float(bn_atm+100), {}).get('PE', {}).get('ltp', round(bn_live_ltp+57.65, 2)):.2f}", "Volume": "7,461,600", "OI": "12,400", "Liquidity Score": "92/100", "Verdict": "ITM (Higher Premium)"},
+            {"Rank": "#3", "Strike": f"{bn_atm-100} PE", "Type": "OTM", "LTP": f"₹{oc_bn.get(float(bn_atm-100), {}).get('PE', {}).get('ltp', round(bn_live_ltp-55.65, 2)):.2f}", "Volume": "8,324,640", "OI": "14,800", "Liquidity Score": "86/100", "Verdict": "OTM"}
         ],
         "ladder": [
-            {"Price Level": f"₹{bn_tgt:.2f} [Target TP]", "Bid Volume": "45,000", "Ask Volume": "380,000", "Net Delta": "+335,000", "Liquidity Type": "Put Squeeze Target 🎯"},
-            {"Price Level": f"₹{bn_max_chase:.2f} [Stop Chase]", "Bid Volume": "68,000", "Ask Volume": "140,000", "Net Delta": "+72,000", "Liquidity Type": "Anti-Chase Barrier ⚠️"},
-            {"Price Level": f"₹{bn_live_ltp:.2f} [Live Entry LTP]", "Bid Volume": "142,000", "Ask Volume": "490,000", "Net Delta": "+348,000", "Liquidity Type": "REAL-TIME ENTRY ZONE 🔴"},
-            {"Price Level": f"₹{bn_ob:.2f} [Order Block]", "Bid Volume": "210,000", "Ask Volume": "650,000", "Net Delta": "+440,000", "Liquidity Type": "Institutional POC Absorption 🏛️"},
-            {"Price Level": f"₹{bn_sl:.2f} [Strict SL]", "Bid Volume": "320,000", "Ask Volume": "45,000", "Net Delta": "-275,000", "Liquidity Type": "Invalidation Floor 🛡️"}
+            {"Price Level": f"₹{bn_tgt_def:.2f} [Target TP]", "Bid Volume": "45,000", "Ask Volume": "380,000", "Net Delta": "+335,000", "Liquidity Type": "Put Squeeze Target 🎯"},
+            {"Price Level": f"₹{bn_chase_def:.2f} [Stop Chase]", "Bid Volume": "68,000", "Ask Volume": "140,000", "Net Delta": "+72,000", "Liquidity Type": "Anti-Chase Barrier ⚠️"},
+            {"Price Level": f"₹{bn_live_ltp:.2f} [Current Live LTP]", "Bid Volume": "142,000", "Ask Volume": "490,000", "Net Delta": "+348,000", "Liquidity Type": "LIVE RUNNING PRICE 🔴"},
+            {"Price Level": f"₹{bn_entry_def:.2f} [Entry Order Block]", "Bid Volume": "210,000", "Ask Volume": "650,000", "Net Delta": "+440,000", "Liquidity Type": "Entry Level (OB) 🏛️"},
+            {"Price Level": f"₹{bn_sl_def:.2f} [Strict SL]", "Bid Volume": "320,000", "Ask Volume": "45,000", "Net Delta": "-275,000", "Liquidity Type": "Invalidation Floor 🛡️"}
         ]
     },
     "NIFTY": {
         "trend": f"BEARISH SLIDE ({nifty_chg:+.2f} PTS)",
         "trend_color": "#ef4444",
-        "trend_summary": f"Nifty slipping to {nifty_spot:,.2f} ({nifty_pchg:+.2f}%). Massive call writing from 25,650-25,700.",
+        "trend_summary": f"Nifty slipping to {nifty_spot:,.2f} ({nifty_pchg:+.2f}%). Heavy call writing.",
         "pcr": 0.61,
         "pcr_desc": "Heavy Call Resistance",
         "direction": "PUT",
-        "has_trade": nifty_status["is_active"],
-        "lifecycle": nifty_status,
+        "has_trade": nifty_tracker["is_active"],
+        "tracker": nifty_tracker,
         "selected_strike": f"{nifty_atm} PUT (PE)",
-        "strike_reason": f"Strike {nifty_atm} PE selected: Highest Traded Volume ({nifty_live_vol:,.0f} contracts) | Current Fresh Entry",
+        "strike_reason": f"Strike {nifty_atm} PE selected: Highest Traded Volume ({nifty_live_vol:,.0f} contracts)",
         "volume_contracts": f"{nifty_live_vol:,.0f} Contracts",
         "open_interest": f"{nifty_live_oi:,.0f} OI",
         
         "current_ltp": nifty_live_ltp,
-        "ideal_ob": nifty_ob,
-        "max_chase": nifty_max_chase,
-        "sl": nifty_sl,
-        "tgt": nifty_tgt,
-        "vwap": round(nifty_live_ltp * 0.98, 1),
+        "ideal_ob": nifty_entry_def,
+        "max_chase": nifty_chase_def,
+        "sl": nifty_sl_def,
+        "tgt": nifty_tgt_def,
         
         "spot": nifty_spot,
         "spot_txt": f"{nifty_spot:,.2f}",
@@ -259,29 +252,29 @@ market_radar = {
         "gamma": 0.0014,
         "vega": 16.0,
         "ranked_strikes": [
-            {"Rank": "⭐ #1 (SELECTED)", "Strike": f"{nifty_atm} PE", "Type": "ATM", "LTP": f"₹{nifty_live_ltp:.2f}", "Volume": f"{nifty_live_vol:,.0f}", "OI": f"{nifty_live_oi:,.0f}", "Liquidity Score": "98/100 🔥", "Verdict": nifty_status["badge"]},
+            {"Rank": "⭐ #1 (SELECTED)", "Strike": f"{nifty_atm} PE", "Type": "ATM", "LTP": f"₹{nifty_live_ltp:.2f}", "Volume": f"{nifty_live_vol:,.0f}", "OI": f"{nifty_live_oi:,.0f}", "Liquidity Score": "98/100 🔥", "Verdict": nifty_tracker["badge"]},
             {"Rank": "#2", "Strike": f"{nifty_atm+50} PE", "Type": "ITM", "LTP": f"₹{oc_nifty.get(float(nifty_atm+50), {}).get('PE', {}).get('ltp', round(nifty_live_ltp+28, 2)):.2f}", "Volume": "194,726,155", "OI": "142,000", "Liquidity Score": "91/100", "Verdict": "ITM"},
             {"Rank": "#3", "Strike": f"{nifty_atm-50} PE", "Type": "OTM", "LTP": f"₹{oc_nifty.get(float(nifty_atm-50), {}).get('PE', {}).get('ltp', round(nifty_live_ltp-26, 2)):.2f}", "Volume": "151,818,420", "OI": "115,000", "Liquidity Score": "84/100", "Verdict": "OTM"}
         ],
         "ladder": [
-            {"Price Level": f"₹{nifty_tgt:.2f} [Target TP]", "Bid Volume": "38,000", "Ask Volume": "220,000", "Net Delta": "+182,000", "Liquidity Type": "Target Pool 🎯"},
-            {"Price Level": f"₹{nifty_max_chase:.2f} [Stop Chase]", "Bid Volume": "54,000", "Ask Volume": "110,000", "Net Delta": "+56,000", "Liquidity Type": "Anti-Chase Barrier ⚠️"},
+            {"Price Level": f"₹{nifty_tgt_def:.2f} [Target TP]", "Bid Volume": "38,000", "Ask Volume": "220,000", "Net Delta": "+182,000", "Liquidity Type": "Target Pool 🎯"},
+            {"Price Level": f"₹{nifty_chase_def:.2f} [Stop Chase]", "Bid Volume": "54,000", "Ask Volume": "110,000", "Net Delta": "+56,000", "Liquidity Type": "Anti-Chase Barrier ⚠️"},
             {"Price Level": f"₹{nifty_live_ltp:.2f} [Live Entry LTP]", "Bid Volume": "88,000", "Ask Volume": "310,000", "Net Delta": "+222,000", "Liquidity Type": "REAL-TIME ENTRY ZONE 🔴"},
-            {"Price Level": f"₹{nifty_ob:.2f} [Order Block]", "Bid Volume": "140,000", "Ask Volume": "580,000", "Net Delta": "+440,000", "Liquidity Type": "Operator Block Absorption 🏛️"},
-            {"Price Level": f"₹{nifty_sl:.2f} [Strict SL]", "Bid Volume": "210,000", "Ask Volume": "40,000", "Net Delta": "-170,000", "Liquidity Type": "SL Liquidity Floor 🛡️"}
+            {"Price Level": f"₹{nifty_entry_def:.2f} [Order Block]", "Bid Volume": "140,000", "Ask Volume": "580,000", "Net Delta": "+440,000", "Liquidity Type": "Operator Block Absorption 🏛️"},
+            {"Price Level": f"₹{nifty_sl_def:.2f} [Strict SL]", "Bid Volume": "210,000", "Ask Volume": "40,000", "Net Delta": "-170,000", "Liquidity Type": "SL Liquidity Floor 🛡️"}
         ]
     },
     "SENSEX": {
         "trend": f"SIDEWAYS CONSOLIDATION ({sensex_chg:+.2f} PTS)",
         "trend_color": "#f59e0b",
-        "trend_summary": f"Sensex hovering at {sensex_spot:,.2f} with low delta conviction. No edge.",
+        "trend_summary": f"Sensex hovering at {sensex_spot:,.2f} with low delta conviction.",
         "pcr": 0.88,
         "pcr_desc": "Sideways Momentum",
         "direction": "PUT",
         "has_trade": False,
-        "lifecycle": {"badge": "WAITING FOR CLEAN BREAKOUT", "state": "WAITING", "is_active": False, "status_text": "No trade will be issued on SENSEX until institutional confirmation occurs."},
+        "tracker": {"badge": "WAITING FOR CLEAN BREAKOUT", "state": "WAITING", "is_active": False, "status_text": "No trade will be issued on SENSEX until institutional confirmation occurs."},
         "selected_strike": "NONE (AWAITING CLEAN SETUP)",
-        "strike_reason": "Orderflow delta participation below institutional threshold. Capital protected.",
+        "strike_reason": "Capital protected.",
         "volume_contracts": "-",
         "open_interest": "-",
         "current_ltp": 435.00,
@@ -289,7 +282,6 @@ market_radar = {
         "max_chase": 450.00,
         "sl": 370.00,
         "tgt": 560.00,
-        "vwap": 422.00,
         "spot": sensex_spot,
         "spot_txt": f"{sensex_spot:,.2f}",
         "chg_txt": f"{sensex_chg:+.2f} ({sensex_pchg:+.2f}%)",
@@ -323,7 +315,7 @@ ltp = d["current_ltp"]
 ob = d["ideal_ob"]
 cap = d["max_chase"]
 is_put = (d["direction"] == "PUT")
-lifecycle = d["lifecycle"]
+tracker = d["tracker"]
 
 # 4. STEP 1 TO STEP 4 DECISION PIPELINE
 st.markdown(f"""
@@ -351,24 +343,29 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 5. DYNAMIC TRADE LIFECYCLE BANNER
-# When Target is hit, or SL is hit, or Setup is live:
+# 5. DYNAMIC PERSISTENT POSITION BANNER (STAYS ACTIVE UNTIL SL OR TARGET HIT)
 if d["has_trade"]:
+    pos = tracker.get("pos", {})
+    pnl_pts = pos.get("pnl_pts", round(ltp - ob, 2))
+    pnl_pct = pos.get("pnl_pct", round(((ltp - ob) / ob) * 100, 2))
+    pnl_color = "#10b981" if pnl_pts >= 0 else "#f43f5e"
+    
     st.markdown(f"""
     <div class="banner-confirmed banner-put">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
             <div>
                 <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
-                    <span class="badge-put">{lifecycle['badge']}</span>
-                    <span style="color: #fca5a5; font-weight: 700; font-size: 13px;">
-                        {d['strike_reason']}
+                    <span class="badge-put">ACTIVE TRADE TRACKER (LOCKED)</span>
+                    <span style="color: {pnl_color}; font-weight: 800; font-size: 14px;">
+                        LIVE P&L: {pnl_pts:+.2f} PTS ({pnl_pct:+.2f}%)
                     </span>
+                    <span style="color: #94a3b8; font-size: 13px;">| Premium Locked Until SL/Target</span>
                 </div>
                 <h1 style="margin: 0; font-size: 32px; font-weight: 800; color: #ffffff; letter-spacing: -0.02em;">
                     BUY {sel_idx} {d['selected_strike']}
                 </h1>
                 <div style="color: #fecaca; font-size: 14px; margin-top: 6px;">
-                    {lifecycle['status_text']}
+                    {tracker['status_text']}
                 </div>
             </div>
             <div style="display: flex; gap: 32px; margin-top: 8px;">
@@ -385,25 +382,25 @@ if d["has_trade"]:
                 <div style="text-align: right;">
                     <div style="color: #ef4444; font-size: 11px; font-weight: 700; text-transform: uppercase;">STRICT SL</div>
                     <div style="color: #ef4444; font-size: 30px; font-weight: 800;">₹{d['sl']:.2f}</div>
-                    <div style="color: #94a3b8; font-size: 12px;">Risk: ₹{(ltp - d['sl']):.2f}</div>
+                    <div style="color: #94a3b8; font-size: 12px;">Risk Buffer: ₹{(ltp - d['sl']):.2f}</div>
                 </div>
                 <div style="text-align: right;">
                     <div style="color: #10b981; font-size: 11px; font-weight: 700; text-transform: uppercase;">TARGET (TP)</div>
                     <div style="color: #10b981; font-size: 30px; font-weight: 800;">₹{d['tgt']:.2f}</div>
-                    <div style="color: #38bdf8; font-size: 12px;">Reward: ₹{(d['tgt'] - ltp):.2f} (1:2 RR)</div>
+                    <div style="color: #38bdf8; font-size: 12px;">Dist to Target: ₹{(d['tgt'] - ltp):.2f}</div>
                 </div>
             </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
-elif lifecycle.get("state") == "TARGET_HIT":
+elif tracker.get("state") == "TARGET_HIT":
     st.markdown(f"""
     <div class="banner-confirmed banner-completed">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
             <div>
                 <span style="background: #10b981; color: #fff; font-weight: 800; font-size: 12px; padding: 4px 10px; border-radius: 4px;">🎯 TARGET REACHED (+PROFIT BOOKED)</span>
                 <h2 style="margin: 8px 0 0 0; color: #ffffff;">{sel_idx} Trade Completed at Target ₹{d['tgt']:.2f}</h2>
-                <div style="color: #38bdf8; font-size: 14px; margin-top: 4px;">Previous trade successfully exited. Old trade removed. Radar actively scanning for the next entry block...</div>
+                <div style="color: #38bdf8; font-size: 14px; margin-top: 4px;">{tracker['status_text']}</div>
             </div>
             <div style="text-align: right;">
                 <div style="color: #94a3b8; font-size: 11px; font-weight: 700;">LIFECYCLE STATUS</div>
@@ -412,14 +409,14 @@ elif lifecycle.get("state") == "TARGET_HIT":
         </div>
     </div>
     """, unsafe_allow_html=True)
-elif lifecycle.get("state") == "STOPLOSS_HIT":
+elif tracker.get("state") == "STOPLOSS_HIT":
     st.markdown(f"""
     <div class="banner-confirmed" style="background: rgba(239, 68, 68, 0.15); border: 2px solid #ef4444;">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
             <div>
                 <span style="background: #ef4444; color: #fff; font-weight: 800; font-size: 12px; padding: 4px 10px; border-radius: 4px;">🛑 STOP LOSS EXITED (CAPITAL PROTECTED)</span>
                 <h2 style="margin: 8px 0 0 0; color: #ffffff;">{sel_idx} Trade Invalidation Hit at ₹{d['sl']:.2f}</h2>
-                <div style="color: #fca5a5; font-size: 14px; margin-top: 4px;">Trade closed with controlled risk. Old trade removed. Searching for fresh institutional setup...</div>
+                <div style="color: #fca5a5; font-size: 14px; margin-top: 4px;">{tracker['status_text']}</div>
             </div>
             <div style="text-align: right;">
                 <div style="color: #94a3b8; font-size: 11px; font-weight: 700;">LIFECYCLE STATUS</div>
@@ -447,6 +444,16 @@ else:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+# Action reset button for user convenience
+col_ctrl1, col_ctrl2 = st.columns([1, 4])
+with col_ctrl1:
+    if st.button("🔄 Reset / Find New Trade"):
+        active = load_active_positions()
+        if sel_idx in active:
+            del active[sel_idx]
+            save_active_positions(active)
+            st.rerun()
 
 # 6. ROW 1: LIVE SPOT METRICS (DIRECT REAL-TIME NSE STREAM)
 r1, r2, r3, r4 = st.columns(4)
