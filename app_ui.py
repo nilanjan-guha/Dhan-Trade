@@ -322,8 +322,8 @@ ob = d["ideal_ob"]
 cap = d["max_chase"]
 
 # 7. ADAPTIVE CALL OR PUT TRADE BANNER
+is_put = (d.get("trade_direction") == "PUT")
 if d["has_trade"]:
-    is_put = (d["trade_direction"] == "PUT")
     banner_cls = "banner-buy-put" if is_put else "banner-buy-call"
     badge_cls = "badge-put" if is_put else "badge-call"
     action_text = f"🚨 CONFIRMED OPERATOR {d['trade_direction']} ALERT"
